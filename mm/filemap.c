@@ -2741,9 +2741,23 @@ static inline bool pos_same_folio(loff_t pos1, loff_t pos2, struct folio *folio)
 	return (pos1 >> shift == pos2 >> shift);
 }
 
-static void filemap_end_dropbehind_read(struct folio *folio)
+static bool filemap_read_folio_consumed(struct folio *folio, loff_t pos)
+{
+	return pos >= folio_pos(folio) + folio_size(folio);
+}
+
+static bool filemap_read_obviously_sequential(struct file_ra_state *ra,
+					      loff_t start_pos)
+{
+	return ra->prev_pos >= 0 && start_pos == ra->prev_pos;
+}
+
+static void filemap_end_dropbehind_read(struct folio *folio, loff_t pos,
+					bool sequential)
 {
 	if (!folio_test_dropbehind(folio))
+		return;
+	if (!filemap_read_folio_consumed(folio, pos) && sequential)
 		return;
 	if (folio_test_writeback(folio) || folio_test_dirty(folio))
 		return;
@@ -2776,6 +2790,9 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 	struct folio_batch fbatch;
 	int i, error = 0;
 	bool writably_mapped;
+	const loff_t read_start_pos = iocb->ki_pos;
+	const bool sequential = filemap_read_obviously_sequential(ra,
+						read_start_pos);
 	loff_t isize, end_offset;
 	loff_t last_pos = ra->prev_pos;
 
@@ -2869,7 +2886,8 @@ put_folios:
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
 			struct folio *folio = fbatch.folios[i];
 
-			filemap_end_dropbehind_read(folio);
+			filemap_end_dropbehind_read(folio, iocb->ki_pos,
+						    sequential);
 			folio_put(folio);
 		}
 		folio_batch_init(&fbatch);
