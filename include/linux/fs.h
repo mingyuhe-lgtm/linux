@@ -1256,6 +1256,8 @@ static inline int ra_has_index(struct file_ra_state *ra, pgoff_t index)
  * @f_ra: file's readahead state
  * @f_freeptr: Pointer used by SLAB_TYPESAFE_BY_RCU file cache (don't touch.)
  * @f_ref: reference count
+ * @f_dropbehind_index: index of the RWF_DONTCACHE read folio kept behind
+ * @f_dropbehind_nr: number of pages in @f_dropbehind_index, 0 if empty
  */
 struct file {
 	spinlock_t			f_lock;
@@ -1297,6 +1299,8 @@ struct file {
 	};
 	file_ref_t			f_ref;
 	/* --- cacheline 3 boundary (192 bytes) --- */
+	pgoff_t				f_dropbehind_index;
+	unsigned int			f_dropbehind_nr;
 } __randomize_layout
   __attribute__((aligned(4)));	/* lest something weird decides that 2 is OK */
 
