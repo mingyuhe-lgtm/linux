@@ -2752,29 +2752,110 @@ static inline bool pos_same_folio(loff_t pos1, loff_t pos2, struct folio *folio)
 	return (pos1 >> shift == pos2 >> shift);
 }
 
-static bool filemap_read_folio_consumed(struct folio *folio, loff_t pos)
+static void filemap_dropbehind_invalidate(struct address_space *mapping)
 {
-	return pos >= folio_pos(folio) + folio_size(folio);
+	pgoff_t indices[FOLIO_BATCH_SIZE];
+	struct folio_batch fbatch;
+	pgoff_t index = 0;
+	int i;
+
+	folio_batch_init(&fbatch);
+	while (find_lock_entries(mapping, &index, -1, &fbatch, indices)) {
+		int nr = folio_batch_count(&fbatch);
+
+		for (i = 0; i < nr; i++) {
+			struct folio *folio = fbatch.folios[i];
+
+			if (xa_is_value(folio))
+				continue;
+			if (folio_test_dropbehind(folio))
+				filemap_end_dropbehind(folio);
+			folio_unlock(folio);
+		}
+
+		folio_batch_remove_exceptionals(&fbatch);
+		folio_batch_release(&fbatch);
+		cond_resched();
+	}
 }
 
-static bool filemap_read_obviously_sequential(struct file_ra_state *ra,
-					      loff_t start_pos)
+void filemap_dropbehind_release(struct file *file)
 {
-	return ra->prev_pos >= 0 && start_pos == ra->prev_pos;
+	struct address_space *mapping = file->f_mapping;
+
+	if (!mapping || !READ_ONCE(file->f_dropbehind_nr))
+		return;
+	WRITE_ONCE(file->f_dropbehind_index, 0);
+	WRITE_ONCE(file->f_dropbehind_nr, 0);
+	filemap_dropbehind_invalidate(mapping);
 }
 
-static void filemap_end_dropbehind_read(struct folio *folio, loff_t pos,
-					bool sequential)
+static void filemap_try_end_dropbehind(struct folio *folio)
 {
 	if (!folio_test_dropbehind(folio))
-		return;
-	if (!filemap_read_folio_consumed(folio, pos) && sequential)
 		return;
 	if (folio_test_writeback(folio) || folio_test_dirty(folio))
 		return;
 	if (folio_trylock(folio)) {
 		filemap_end_dropbehind(folio);
 		folio_unlock(folio);
+	}
+}
+
+static void filemap_try_end_dropbehind_at(struct address_space *mapping,
+					  pgoff_t index)
+{
+	struct folio *folio;
+
+	folio = filemap_get_folio(mapping, index);
+	if (IS_ERR(folio))
+		return;
+	filemap_try_end_dropbehind(folio);
+	folio_put(folio);
+}
+
+static bool filemap_read_update_dropbehind(struct file *file,
+					   struct folio *folio,
+					   pgoff_t *drop_index)
+{
+	pgoff_t index = folio->index;
+	pgoff_t old_index;
+	unsigned int nr = folio_nr_pages(folio);
+	unsigned int old_nr;
+
+	/*
+	 * This is a best-effort marker, not ownership.  It deliberately keeps
+	 * no folio reference so that RWF_DONTCACHE reads do not pin the last
+	 * large folio against reclaim, split or migration.  Concurrent readers
+	 * may race and miss a runtime drop; release-time scanning catches any
+	 * remaining PG_dropbehind folios.
+	 */
+	old_nr = READ_ONCE(file->f_dropbehind_nr);
+	if (old_nr) {
+		old_index = READ_ONCE(file->f_dropbehind_index);
+		if (index >= old_index && index - old_index < old_nr)
+			return false;
+	}
+
+	WRITE_ONCE(file->f_dropbehind_index, index);
+	WRITE_ONCE(file->f_dropbehind_nr, nr);
+	if (!old_nr)
+		return false;
+
+	*drop_index = old_index;
+	return true;
+}
+
+static void filemap_end_dropbehind_read(struct file *file, struct folio *folio)
+{
+	pgoff_t drop_index;
+
+	if (!folio_test_dropbehind(folio))
+		return;
+	if (filemap_read_update_dropbehind(file, folio, &drop_index)) {
+		struct address_space *mapping = file->f_mapping;
+
+		filemap_try_end_dropbehind_at(mapping, drop_index);
 	}
 }
 
@@ -2801,9 +2882,6 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 	struct folio_batch fbatch;
 	int i, error = 0;
 	bool writably_mapped;
-	const loff_t read_start_pos = iocb->ki_pos;
-	const bool sequential = filemap_read_obviously_sequential(ra,
-						read_start_pos);
 	loff_t isize, end_offset;
 	loff_t last_pos = ra->prev_pos;
 
@@ -2897,8 +2975,7 @@ put_folios:
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
 			struct folio *folio = fbatch.folios[i];
 
-			filemap_end_dropbehind_read(folio, iocb->ki_pos,
-						    sequential);
+			filemap_end_dropbehind_read(filp, folio);
 			folio_put(folio);
 		}
 		folio_batch_init(&fbatch);

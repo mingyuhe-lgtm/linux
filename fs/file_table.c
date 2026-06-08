@@ -24,6 +24,7 @@
 #include <linux/sysctl.h>
 #include <linux/percpu_counter.h>
 #include <linux/percpu.h>
+#include <linux/pagemap.h>
 #include <linux/task_work.h>
 #include <linux/swap.h>
 #include <linux/kmemleak.h>
@@ -198,6 +199,8 @@ static int init_file(struct file *f, int flags, const struct cred *cred)
 	mutex_init(&f->f_pos_lock);
 	memset(&f->__f_path, 0, sizeof(f->f_path));
 	memset(&f->f_ra, 0, sizeof(f->f_ra));
+	f->f_dropbehind_index = 0;
+	f->f_dropbehind_nr = 0;
 
 	f->f_flags	= flags;
 	f->f_mode	= OPEN_FMODE(flags);
@@ -506,6 +509,7 @@ static void __fput(struct file *file)
 		if (file->f_op->fasync)
 			file->f_op->fasync(-1, file, 0);
 	}
+	filemap_dropbehind_release(file);
 	if (file->f_op->release)
 		file->f_op->release(inode, file);
 	if (unlikely(S_ISCHR(inode->i_mode) && inode->i_cdev != NULL &&
